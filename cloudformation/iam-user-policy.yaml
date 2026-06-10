@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Assignment 18 - IAM Policy Testing and Validation
+  Creates a developer-test IAM user with:
+  - Restrictive custom policy (S3 read-only for Dev-tagged buckets, EC2 t2/t3.micro only, VPC-locked)
+  - Permission boundary (hard ceiling on what user can ever do)
+  - Assume role for session policy testing
+
+# ─── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: manvith
+    Description: Prefix used for all resource names
+
+  DevVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      The VPC ID where developers are allowed to create EC2 resources.
+      Developers cannot launch instances in any other VPC.
+
+  AllowedRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region where EC2 resources are allowed
+
+# ─── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PERMISSION BOUNDARY
+  # Think of this as a fence around the yard.
+  # Even if someone gives the developer admin permissions,
+  # they can NEVER go beyond this boundary.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  DeveloperPermissionBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-permission-boundary"
+      Description: >
+        Permission boundary - the absolute maximum permissions a developer can have.
+        Even AdministratorAccess cannot exceed this.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+
+          # Allow S3 read actions at most
+          - Sid: BoundaryAllowS3ReadOnly
+            Effect: Allow
+            Action:
+              - s3:Get*
+              - s3:List*
+            Resource: "*"
+
+          # Allow limited EC2 actions at most
+          - Sid: BoundaryAllowEC2Limited
+            Effect: Allow
+            Action:
+              - ec2:Describe*
+              - ec2:RunInstances
+              - ec2:TerminateInstances
+              - ec2:StopInstances
+              - ec2:StartInstances
+            Resource: "*"
+
+          # Allow STS (needed for assuming roles)
+          - Sid: BoundaryAllowSTS
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+              - sts:GetCallerIdentity
+            Resource: "*"
+
+          # Hard DENY: never allow IAM changes (prevents privilege escalation)
+          - Sid: BoundaryDenyIAMChanges
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:DeleteUser
+              - iam:AttachUserPolicy
+              - iam:DetachUserPolicy
+              - iam:PutUserPolicy
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:AttachRolePolicy
+              - iam:CreatePolicy
+              - iam:DeletePolicy
+              - iam:PassRole
+            Resource: "*"
+
+          # Hard DENY: never touch production-tagged resources
+          - Sid: BoundaryDenyProductionResources
+            Effect: Deny
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Environment: production
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CUSTOM DEVELOPER POLICY
+  # This is what the developer is actually allowed to do day-to-day.
+  # It works together with the boundary above (both must say Allow).
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  DeveloperPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-developer-policy"
+      Description: >
+        Restrictive developer policy: S3 read-only (Dev-tagged buckets),
+        EC2 t2/t3.micro only in the approved Dev VPC, no production access.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+
+          # ── S3 Section ────────────────────────────────────────────────────
+
+          # Allow listing all buckets (the user needs this to even see buckets exist)
+          - Sid: S3AllowListAllBuckets
+            Effect: Allow
+            Action:
+              - s3:ListAllMyBuckets
+            Resource: "arn:aws:s3:::*"
+
+          # Allow read-only access ONLY to buckets tagged Team=Dev
+          # The condition key aws:ResourceTag checks the tag on the S3 bucket
+          - Sid: S3AllowReadOnlyDevTaggedBuckets
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketLocation
+              - s3:GetBucketTagging
+              - s3:GetBucketVersioning
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Team: Dev
+
+          # DENY: No deleting S3 objects or buckets - ever
+          # This Deny overrides any Allow, including future policies
+          - Sid: S3DenyAllDeleteActions
+            Effect: Deny
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:DeleteBucket
+              - s3:DeleteBucketPolicy
+            Resource: "*"
+
+          # DENY: No writing to S3
+          - Sid: S3DenyPutActions
+            Effect: Deny
+            Action:
+              - s3:PutObject
+              - s3:PutBucketPolicy
+              - s3:PutBucketAcl
+            Resource: "*"
+
+          # ── EC2 Section ───────────────────────────────────────────────────
+
+          # Allow read-only EC2 describe actions (needed to see what exists)
+          - Sid: EC2AllowDescribeAll
+            Effect: Allow
+            Action:
+              - ec2:Describe*
+            Resource: "*"
+
+          # Allow launching instances: ONLY t2.micro or t3.micro
+          # The ec2:InstanceType condition key enforces this on the instance resource
+          - Sid: EC2AllowSmallInstancesOnly
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+            Resource: !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:instance/*"
+            Condition:
+              StringEquals:
+                ec2:InstanceType:
+                  - t2.micro
+                  - t3.micro
+
+          # Allow using subnets ONLY inside the approved Dev VPC
+          # The ec2:Vpc condition checks which VPC the subnet belongs to
+          - Sid: EC2AllowSubnetsInDevVPCOnly
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+            Resource: !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:subnet/*"
+            Condition:
+              StringEquals:
+                ec2:Vpc: !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:vpc/${DevVpcId}"
+
+          # Allow the other resource types needed for RunInstances
+          # (AMI, volume, security group, key pair, network interface)
+          - Sid: EC2AllowRunInstancesSupportResources
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+            Resource:
+              - !Sub "arn:aws:ec2:${AllowedRegion}::image/*"
+              - !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:volume/*"
+              - !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:key-pair/*"
+              - !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:security-group/*"
+              - !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:network-interface/*"
+
+          # DENY: Launching large/expensive instance types
+          # StringNotEquals on InstanceType = "anything that is NOT t2.micro or t3.micro"
+          - Sid: EC2DenyLargeInstanceTypes
+            Effect: Deny
+            Action:
+              - ec2:RunInstances
+            Resource: !Sub "arn:aws:ec2:${AllowedRegion}:${AWS::AccountId}:instance/*"
+            Condition:
+              StringNotEquals:
+                ec2:InstanceType:
+                  - t2.micro
+                  - t3.micro
+
+          # ── Global Section ─────────────────────────────────────────────────
+
+          # DENY: Any access to resources tagged Environment=production
+          # This blocks production S3 buckets, EC2, RDS, anything tagged production
+          - Sid: GlobalDenyProductionTaggedResources
+            Effect: Deny
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Environment: production
+
+          # DENY: Prevent creating resources in unapproved regions
+          - Sid: GlobalDenyUnapprovedRegions
+            Effect: Deny
+            NotAction:
+              - iam:*
+              - sts:*
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:RequestedRegion:
+                  - !Ref AllowedRegion
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # IAM USER
+  # The developer-test user with the policy and boundary attached
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  DeveloperTestUser:
+    Type: AWS::IAM::User
+    DependsOn:
+      - DeveloperPermissionBoundary
+      - DeveloperPolicy
+    Properties:
+      UserName: !Sub "${ProjectName}-developer-test"
+      # The boundary is attached here - it cannot be removed by the user themselves
+      PermissionsBoundary: !Ref DeveloperPermissionBoundary
+      ManagedPolicies:
+        - !Ref DeveloperPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: dev
+        - Key: Team
+          Value: Dev
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # IAM ROLE FOR ASSUME ROLE TESTING
+  # The developer-test user can assume this role.
+  # Session policies can be passed at assume-role time for extra restriction.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  DeveloperAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-developer-role"
+      Description: Role that developer-test user can assume. Used to test session policies.
+      # Trust policy: only the developer-test user can assume this role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt DeveloperTestUser.Arn
+            Action: sts:AssumeRole
+            Condition:
+              BoolIfExists:
+                aws:MultiFactorAuthPresent: "false"
+      # Role also gets the boundary (defense in depth)
+      PermissionsBoundary: !Ref DeveloperPermissionBoundary
+      ManagedPolicies:
+        - !Ref DeveloperPolicy
+      MaxSessionDuration: 3600  # 1 hour max
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: dev
+
+  # Allow the developer user to assume the role
+  DeveloperAssumeRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-allow-assume-role"
+      Users:
+        - !Ref DeveloperTestUser
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !GetAtt DeveloperAssumeRole.Arn
+
+# ─── Outputs ────────────────────────────────────────────────────────────────────
+Outputs:
+
+  DeveloperUserName:
+    Description: IAM username of the developer-test user
+    Value: !Ref DeveloperTestUser
+    Export:
+      Name: !Sub "${ProjectName}-developer-user-name"
+
+  DeveloperUserArn:
+    Description: Full ARN of the developer-test IAM user
+    Value: !GetAtt DeveloperTestUser.Arn
+    Export:
+      Name: !Sub "${ProjectName}-developer-user-arn"
+
+  PermissionBoundaryArn:
+    Description: ARN of the permission boundary policy
+    Value: !Ref DeveloperPermissionBoundary
+    Export:
+      Name: !Sub "${ProjectName}-permission-boundary-arn"
+
+  DeveloperPolicyArn:
+    Description: ARN of the developer custom policy
+    Value: !Ref DeveloperPolicy
+    Export:
+      Name: !Sub "${ProjectName}-developer-policy-arn"
+
+  DeveloperRoleArn:
+    Description: ARN of the role that developer-test user can assume
+    Value: !GetAtt DeveloperAssumeRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-developer-role-arn"
+
+  DevVpcId:
+    Description: VPC ID where developers are allowed to create EC2 resources
+    Value: !Ref DevVpcId
+    Export:
+      Name: !Sub "${ProjectName}-dev-vpc-id"

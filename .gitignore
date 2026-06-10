@@ -1,0 +1,22 @@
+# Sensitive files - never commit these
+*.pem
+*.key
+credentials
+.env
+.env.*
+aws-credentials.json
+
+# Screenshots (commit manually after review)
+screenshots/*.png
+screenshots/*.jpg
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+
+# VS Code
+.vscode/
+.DS_Store
