@@ -1,4 +1,4 @@
-# Assignment 18 - IAM Policy Testing Guide
+# IAM Policy Testing 
 
 This guide walks you through testing all the policies in the AWS Console.  
 Run the scripts first, then follow these steps to verify everything visually.
